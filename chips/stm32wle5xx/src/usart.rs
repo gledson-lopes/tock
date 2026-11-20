@@ -7,8 +7,10 @@ use kernel::ErrorCode;
 use kernel::deferred_call::{DeferredCall, DeferredCallClient};
 use kernel::hil;
 use kernel::platform::chip::ClockInterface;
+use kernel::platform::chip::PanicWriter;
 use kernel::utilities::StaticRef;
 use kernel::utilities::cells::{OptionalCell, TakeCell};
+use kernel::utilities::io_write::IoWrite;
 use tock_registers_v0::interfaces::{ReadWriteable, Readable, Writeable};
 use tock_registers_v0::registers::{ReadOnly, ReadWrite};
 use tock_registers_v0::{register_bitfields, register_structs};
@@ -18,7 +20,7 @@ use crate::clocks::phclk;
 
 register_structs! {
     /// Universal synchronous asynchronous receiver transmitter
-    UsartRegisters {
+    pub UsartRegisters {
         /// Control register 1
         (0x000 => cr1: ReadWrite<u32, CR1::Register>),
         /// Control register 2
@@ -313,9 +315,9 @@ register_bitfields![u32,
 
 ];
 
-const USART1_BASE: StaticRef<UsartRegisters> =
+pub const USART1_BASE: StaticRef<UsartRegisters> =
     unsafe { StaticRef::new(0x40013800 as *const UsartRegisters) };
-const USART2_BASE: StaticRef<UsartRegisters> =
+pub const USART2_BASE: StaticRef<UsartRegisters> =
     unsafe { StaticRef::new(0x40004400 as *const UsartRegisters) };
 
 #[allow(non_camel_case_types)]
@@ -409,11 +411,38 @@ impl<'a> Usart<'a> {
         self.clock.disable();
     }
 
-    // for use by panic in io.rs
-    pub fn send_byte(&self, byte: u8) {
-        // loop till TXE (Transmit data register empty) becomes 1
-        while !self.registers.isr.is_set(ISR::TXE) {}
-        self.registers.tdr.set(byte.into());
+    /// Bring the USART up with the fixed 115200 8N1 configuration this
+    /// driver supports.
+    ///
+    /// Shared by the [`hil::uart::Configure`] implementation and by the
+    /// panic writer, which uses this when the kernel did not configure the
+    /// USART before the panic occurred.
+    fn configure_registers(registers: &UsartRegisters) {
+        // Configure the word length - 0: 1 Start bit, 8 Data bits, n Stop bits
+        registers.cr1.modify(CR1::M0::CLEAR);
+        registers.cr1.modify(CR1::M1::CLEAR);
+
+        // Set the stop bit length - 00: 1 Stop bits
+        registers.cr2.modify(CR2::STOP.val(0b00_u32));
+
+        // Set no parity
+        registers.cr1.modify(CR1::PCE::CLEAR);
+
+        // Set the baud rate. By default OVER8 is 0 (oversampling by 16) and
+        // PCLK1 is at 4Mhz. The desired baud rate is 115.2KBps. So according
+        // to Table 159 of reference manual, the value for BRR is 138.8888 (0x8A)
+        // DIV_Fraction = 0x5
+        // DIV_Mantissa = 0x4
+        registers.brr.modify(BRR::BRR.val(0x22_u32));
+
+        // Enable transmit block
+        registers.cr1.modify(CR1::TE::SET);
+
+        // Enable receive block
+        registers.cr1.modify(CR1::RE::SET);
+
+        // Enable USART
+        registers.cr1.modify(CR1::UE::SET);
     }
 
     fn enable_transmit_interrupt(&self) {
@@ -606,31 +635,7 @@ impl hil::uart::Configure for Usart<'_> {
             );
         }
 
-        // Configure the word length - 0: 1 Start bit, 8 Data bits, n Stop bits
-        self.registers.cr1.modify(CR1::M0::CLEAR);
-        self.registers.cr1.modify(CR1::M1::CLEAR);
-
-        // Set the stop bit length - 00: 1 Stop bits
-        self.registers.cr2.modify(CR2::STOP.val(0b00_u32));
-
-        // Set no parity
-        self.registers.cr1.modify(CR1::PCE::CLEAR);
-
-        // Set the baud rate. By default OVER8 is 0 (oversampling by 16) and
-        // PCLK1 is at 4Mhz. The desired baud rate is 115.2KBps. So according
-        // to Table 159 of reference manual, the value for BRR is 138.8888 (0x8A)
-        // DIV_Fraction = 0x5
-        // DIV_Mantissa = 0x4
-        self.registers.brr.modify(BRR::BRR.val(0x22_u32));
-
-        // Enable transmit block
-        self.registers.cr1.modify(CR1::TE::SET);
-
-        // Enable receive block
-        self.registers.cr1.modify(CR1::RE::SET);
-
-        // Enable USART
-        self.registers.cr1.modify(CR1::UE::SET);
+        Self::configure_registers(&self.registers);
 
         Ok(())
     }
@@ -693,5 +698,79 @@ impl ClockInterface for UsartClock<'_> {
 
     fn disable(&self) {
         self.0.disable();
+    }
+}
+
+struct UsartPanicWriter {
+    /// If the USART is not enabled, this is `None` and all writes are
+    /// ignored. Polling the status flags of a disabled USART would spin
+    /// forever.
+    registers: Option<StaticRef<UsartRegisters>>,
+}
+
+impl IoWrite for UsartPanicWriter {
+    fn write(&mut self, buf: &[u8]) -> usize {
+        let Some(regs) = self.registers else {
+            return 0;
+        };
+
+        for &byte in buf {
+            while !regs.isr.is_set(ISR::TXE) {}
+            regs.tdr.set(byte as u32);
+        }
+        buf.len()
+    }
+}
+
+impl core::fmt::Write for UsartPanicWriter {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        self.write(s.as_bytes());
+        Ok(())
+    }
+}
+
+/// Configuration for the synchronous USART panic writer.
+///
+/// A USART which the kernel already configured is used as is. Otherwise, it
+/// is brought up with the fixed 115200 8N1 configuration this driver
+/// supports.
+pub struct UsartPanicWriterConfig {
+    pub registers: StaticRef<UsartRegisters>,
+}
+
+impl PanicWriter for Usart<'_> {
+    type Config = UsartPanicWriterConfig;
+
+    fn create_panic_writer(
+        config: Self::Config,
+        _panic: &core::panic::PanicInfo,
+    ) -> impl IoWrite + core::fmt::Write {
+        let registers = config.registers;
+
+        if registers.brr.read(BRR::BRR) == 0 {
+            // No baud rate was set yet, so bring the USART up from reset.
+            Self::configure_registers(&registers);
+        } else {
+            // The kernel already set a baud rate, so the USART is
+            // configured. Keep that configuration and only make sure the
+            // transmitter is on and that no interrupts fire while the bytes
+            // are polled out.
+            registers
+                .cr1
+                .modify(CR1::TE::SET + CR1::UE::SET + CR1::TXEIE::CLEAR + CR1::RXNEIE::CLEAR);
+        }
+
+        // If the USART is not enabled (e.g. it is not clocked and its
+        // registers read as zero), ignore all writes rather than spin
+        // forever polling its status flags.
+        let transmit_available = registers.brr.read(BRR::BRR) != 0 && registers.cr1.is_set(CR1::UE);
+
+        UsartPanicWriter {
+            registers: if transmit_available {
+                Some(registers)
+            } else {
+                None
+            },
+        }
     }
 }

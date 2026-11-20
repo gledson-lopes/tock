@@ -10,8 +10,6 @@
 #![no_main]
 #![deny(missing_docs)]
 
-use core::ptr::addr_of_mut;
-
 use capsules_core::virtualizers::virtual_alarm::VirtualMuxAlarm;
 use capsules_extra::lsm303xx;
 use components::gpio::GpioComponent;
@@ -24,9 +22,11 @@ use kernel::hil::led::LedHigh;
 use kernel::hil::time::Counter;
 use kernel::platform::chip::Chip;
 use kernel::platform::{KernelResources, SyscallDriverLookup};
+use kernel::utilities::StaticRef;
 use kernel::utilities::single_thread_value::SingleThreadValue;
 use kernel::{create_capability, debug, static_init};
 use stm32f303xc::chip::Stm32f3xxDefaultPeripherals;
+use stm32f303xc::usart::{USART1_BASE, UsartRegisters};
 use stm32f303xc::wdt;
 
 /// Support routines for debugging I/O.
@@ -45,6 +45,10 @@ type ProcessPrinterInUse = capsules_system::process_printer::ProcessPrinterText;
 /// Resources for when a board panics used by io.rs.
 static PANIC_RESOURCES: SingleThreadValue<PanicResources<ChipHw, ProcessPrinterInUse>> =
     SingleThreadValue::new();
+
+/// The USART the panic handler in io.rs writes to, which is the one the
+/// console uses.
+const PANIC_USART: StaticRef<UsartRegisters> = USART1_BASE;
 
 // How should the kernel respond when a process faults.
 const FAULT_RESPONSE: capsules_system::process_policies::PanicFaultPolicy =
@@ -439,10 +443,6 @@ unsafe fn start() -> (
 
     let uart_mux = components::console::UartMuxComponent::new(&peripherals.usart1, 115200)
         .finalize(components::uart_mux_component_static!());
-
-    // `finalize()` configures the underlying USART, so we need to
-    // tell `send_byte()` not to configure the USART again.
-    (*addr_of_mut!(io::WRITER)).set_initialized();
 
     // Create capabilities that the board needs to call certain protected kernel
     // functions.

@@ -2,68 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Copyright Tock Contributors 2025.
 
-use core::fmt::Write;
 use core::panic::PanicInfo;
-use core::ptr::addr_of_mut;
 
+use kernel::debug;
 use kernel::hil::led;
-use kernel::utilities::io_write::IoWrite;
-
 use kernel::hil::led::Led;
-use kernel::hil::uart;
-use kernel::hil::uart::Configure;
 use stm32wle5jc::chip_specs::Stm32wle5jcSpecs;
-use stm32wle5jc::clocks;
 use stm32wle5jc::gpio::PinId;
-/// Writer is used by kernel::debug to panic message to the serial port.
-pub struct Writer {
-    initialized: bool,
-}
-
-/// Global static for debug writer
-pub static mut WRITER: Writer = Writer { initialized: false };
-
-impl Writer {
-    /// Indicate that USART has already been initialized. Trying to double
-    /// initialize USART1 causes stm32f429zi to go into in in-deterministic state.
-    pub fn set_initialized(&mut self) {
-        self.initialized = true;
-    }
-}
-
-impl Write for Writer {
-    fn write_str(&mut self, s: &str) -> ::core::fmt::Result {
-        self.write(s.as_bytes());
-        Ok(())
-    }
-}
-
-impl IoWrite for Writer {
-    fn write(&mut self, buf: &[u8]) -> usize {
-        let rcc = stm32wle5jc::rcc::Rcc::new();
-        let clocks: clocks::Clocks<Stm32wle5jcSpecs> = clocks::Clocks::new(&rcc);
-        let usart = stm32wle5jc::usart::Usart::new_usart1(&clocks);
-
-        if !self.initialized {
-            self.initialized = true;
-
-            let _ = usart.configure(uart::Parameters {
-                baud_rate: 115200,
-                stop_bits: uart::StopBits::One,
-                parity: uart::Parity::None,
-                hw_flow_control: false,
-                width: uart::Width::Eight,
-            });
-        }
-
-        let mut written = 0;
-        for byte in buf {
-            usart.send_byte(*byte);
-            written += 1;
-        }
-        written
-    }
-}
+use stm32wle5jc::usart::{Usart, UsartPanicWriterConfig};
 
 /// Panic handler.
 #[panic_handler]
@@ -90,35 +36,14 @@ pub fn panic_fmt(info: &PanicInfo) -> ! {
     let led = &mut led::LedLow::new(&pin);
     led.init();
 
-    // USART1: PB6=TX , PB7=RX
-    gpio_ports.get_pin(PinId::PB06).map(|pin| {
-        pin.set_mode(stm32wle5jc::gpio::Mode::AlternateFunctionMode);
-        pin.set_alternate_function(stm32wle5jc::gpio::AlternateFunction::AF7);
-    });
-
-    gpio_ports.get_pin(PinId::PB07).map(|pin| {
-        pin.set_mode(stm32wle5jc::gpio::Mode::AlternateFunctionMode);
-        pin.set_alternate_function(stm32wle5jc::gpio::AlternateFunction::AF7);
-    });
-
-    let usart = stm32wle5jc::usart::Usart::new_usart1(&clocks);
-    usart.enable_clock();
-    let _ = usart.configure(uart::Parameters {
-        baud_rate: 115200,
-        stop_bits: uart::StopBits::One,
-        parity: uart::Parity::None,
-        hw_flow_control: false,
-        width: uart::Width::Eight,
-    });
-
-    unsafe {
-        kernel::debug::panic_print_old(
-            &mut *addr_of_mut!(WRITER),
-            info,
-            &cortexm4::support::nop,
-            crate::PANIC_RESOURCES.get(),
-        );
-    }
+    debug::panic_print::<Usart, crate::ChipHw, crate::ProcessPrinterInUse>(
+        UsartPanicWriterConfig {
+            registers: crate::PANIC_USART,
+        },
+        info,
+        &cortexm4::support::nop,
+        crate::PANIC_RESOURCES.get(),
+    );
 
     // Unique LED blink pattern for panic
     loop {
